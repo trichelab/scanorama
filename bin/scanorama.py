@@ -58,19 +58,21 @@ def plot_clusters(coords, clusters, s=1):
                 c=colors[clusters], s=s)
 
 # Do batch correction on the data.
-def correct(datasets_full, genes_list, hvg=HVG, verbose=VERBOSE):
+def correct(datasets_full, genes_list, hvg=HVG, verbose=VERBOSE,
+            sigma=SIGMA, ds_names=None):
     datasets, genes = merge_datasets(datasets_full, genes_list)
     datasets_dimred, genes = process_data(datasets, genes, hvg=hvg)
     
     datasets_dimred = assemble(
         datasets_dimred, # Assemble in low dimensional space.
         expr_datasets=datasets, # Modified in place.
-        verbose=verbose, knn=KNN, sigma=SIGMA, approx=APPROX
+        verbose=verbose, knn=KNN, sigma=sigma, approx=APPROX,
+        ds_names=ds_names
     )
 
     return datasets, genes
 
-# Randomized SV
+# Randomized SVD.
 def dimensionality_reduce(datasets, dimred=DIMRED):
     X = np.concatenate(datasets)
     X = reduce_dimensionality(X, dim_red_k=dimred)
@@ -110,7 +112,8 @@ def process_data(datasets, genes, hvg=HVG, dimred=DIMRED):
 def visualize(assembled, labels, namespace, data_names,
               gene_names=None, gene_expr=None, genes=None,
               n_iter=N_ITER, perplexity=PERPLEXITY, verbose=VERBOSE,
-              learn_rate=200., early_exag=12., embedding=None, size=1):
+              learn_rate=200., early_exag=12., embedding=None,
+              shuffle_ds=False, size=1):
     # Fit t-SNE.
     if embedding is None:
         tsne = TSNEApprox(n_iter=n_iter, perplexity=perplexity,
@@ -120,11 +123,12 @@ def visualize(assembled, labels, namespace, data_names,
         tsne.fit(np.concatenate(assembled))
         embedding = tsne.embedding_
 
-    rand_idx = range(embedding.shape[0])
-    random.shuffle(rand_idx)
-    embedding = embedding[rand_idx, :]
-    labels = labels[rand_idx]
-    
+    if shuffle_ds:
+        rand_idx = range(embedding.shape[0])
+        random.shuffle(list(rand_idx))
+        embedding = embedding[rand_idx, :]
+        labels = labels[rand_idx]
+
     # Plot clusters together.
     plot_clusters(embedding, labels, s=size)
     plt.title(('Panorama ({} iter, perplexity: {}, sigma: {}, ' +
@@ -134,21 +138,23 @@ def visualize(assembled, labels, namespace, data_names,
     plt.savefig(namespace + '.svg', dpi=500)
 
     # Plot clusters individually.
-    for i in range(len(data_names)):
-        visualize_cluster(embedding, i, labels,
-                          cluster_name=data_names[i], size=size,
-                          viz_prefix=namespace)
+    if not shuffle_ds:
+        for i in range(len(data_names)):
+            visualize_cluster(embedding, i, labels,
+                              cluster_name=data_names[i], size=size,
+                              viz_prefix=namespace)
 
     # Plot gene expression levels.
     if (not gene_names is None) and \
        (not gene_expr is None) and \
        (not genes is None):
-        gene_expr = gene_expr[rand_idx, :]
+        if shuffle_ds:
+            gene_expr = gene_expr[rand_idx, :]
         for gene_name in gene_names:
             visualize_expr(gene_expr, embedding,
                            genes, gene_name, size=size,
                            viz_prefix=namespace)
-    
+
     return embedding
 
 # Exact nearest neighbors search.
@@ -174,9 +180,10 @@ def nn_approx(ds1, ds2, knn=KNN, metric='manhattan', n_trees=10):
     a.build(n_trees)
 
     # Search index.
-    ind = np.zeros((ds1.shape[0], knn), dtype=int)
+    ind = []
     for i in range(ds1.shape[0]):
-        ind[i, :] = a.get_nns_by_vector(ds1[i, :], knn, search_k=-1)
+        ind.append(a.get_nns_by_vector(ds1[i, :], knn, search_k=-1))
+    ind = np.array(ind)
 
     # Match.
     match = set()
@@ -264,9 +271,9 @@ def fill_table(table, i, curr_ds, datasets, base_ds=0,
         table[(i, j)].add((d, r - base))
         assert(r - base >= 0)
 
-# Find the matching pairs of cells between datasets.
-def find_alignments(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
-                    prenormalized=False):
+# Fill table of alignment scores.
+def find_alignments_table(datasets, knn=KNN, approx=APPROX,
+                          verbose=VERBOSE, prenormalized=False):
     if not prenormalized:
         datasets = [ normalize(ds, axis=1) for ds in datasets ]
     
@@ -301,7 +308,17 @@ def find_alignments(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
             table_print[i, j] += table1[(i, j)]
     if verbose > 1:
         print(table_print)
+
+    return table1, table_print, matches
     
+# Find the matching pairs of cells between datasets.
+def find_alignments(datasets, knn=KNN, approx=APPROX, verbose=VERBOSE,
+                    prenormalized=False):
+    table1, _, matches = find_alignments_table(
+        datasets, knn=knn, approx=approx, verbose=verbose,
+        prenormalized=prenormalized
+    )
+
     alignments = [ (i, j) for (i, j), val in reversed(
         sorted(table1.items(), key=operator.itemgetter(1))
     ) if val > ALPHA ]
@@ -365,8 +382,9 @@ def transform(curr_ds, curr_ref, ds_ind, ref_ind, sigma):
 # Finds alignments between datasets and uses them to construct
 # panoramas. "Merges" datasets by correcting gene expression
 # values.
-def assemble(datasets, verbose=VERBOSE, view_match=0, knn=KNN,
-             sigma=SIGMA, approx=APPROX, expr_datasets=None):
+def assemble(datasets, verbose=VERBOSE, view_match=False, knn=KNN,
+             sigma=SIGMA, approx=APPROX, expr_datasets=None,
+             ds_names=None):
     if len(datasets) == 1:
         return datasets
     
@@ -377,7 +395,11 @@ def assemble(datasets, verbose=VERBOSE, view_match=0, knn=KNN,
     panoramas = []
     for i, j in alignments:
         if verbose:
-            print('Processing datasets {}'.format((i, j)))
+            if ds_names is None:
+                print('Processing datasets {}'.format((i, j)))
+            else:
+                print('Processing datasets {} <=> {}'.
+                      format(ds_names[i], ds_names[j]))
         
         # Only consider a dataset a fixed amount of times.
         if not i in ds_assembled:
@@ -528,7 +550,7 @@ def assemble(datasets, verbose=VERBOSE, view_match=0, knn=KNN,
                 panoramas.remove(panoramas_j[0])
 
         # Visualize.
-        if view_match > i:
+        if view_match:
             plot_mapping(curr_ds, curr_ref, ds_ind, ref_ind)
 
     return datasets
